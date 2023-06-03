@@ -16,6 +16,7 @@ import bitsandbytes as bnb
 import pandas as pd
 
 import torch
+from torch import Tensor
 import transformers
 from torch.nn.utils.rnn import pad_sequence
 import argparse
@@ -446,6 +447,58 @@ class DataCollatorForCausalLM(object):
             data_dict['labels'] = labels
         return data_dict
 
+
+class ExtractedCriticSample(TypedDict):
+    input: str
+    continuation: str
+    rating: int
+
+@dataclass
+class DataCollatorForCriticLM(object):
+    tokenizer: transformers.PreTrainedTokenizer
+    source_max_len: int
+
+    def __call__(self, instances: Sequence[ExtractedCriticSample]) -> Dict[str, torch.Tensor]:
+        # Extract elements
+        sources = [f"{self.tokenizer.bos_token}{example['input']}{self.tokenizer.eos_token}" for example in instances]
+        continuations = [f"{example['continuation']}{self.tokenizer.eos_token}" for example in instances]
+        # Tokenize
+        # input includes prompt **and** continuation
+        tokenized_input = self.tokenizer(
+            sources,
+            max_length=self.source_max_len,
+            # TODO: handle truncation ourselves, so we can manage how much of the continuation we lose
+            truncation=True,
+            add_special_tokens=False,
+        )
+        tokenized_continuation = self.tokenizer(
+            continuations,
+            max_length=self.source_max_len,
+            # TODO: handle truncation ourselves, so we can manage how much of the continuation we lose
+            truncation=True,
+            add_special_tokens=False,
+        )
+        # Build the input and labels for causal LM
+        input_ids: List[Tensor] = []
+        continuations: List[Tensor] = [] 
+        for tokenized_source, tokenized_continuation in zip(
+            tokenized_input['input_ids'], 
+            tokenized_continuation['input_ids']
+        ):
+            input_ids.append(torch.tensor(tokenized_source))
+            # TODO: what we want is probably an attention mask indicating which tokens of source, are continuations
+            continuations.append(torch.tensor(tokenized_continuation))
+        # Apply padding
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        continuations = pad_sequence(continuations, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        data_dict = {
+            'input_ids': input_ids,
+            'attention_mask': input_ids.ne(self.tokenizer.pad_token_id),
+            'continuations': continuations,
+        }
+        return data_dict
+
+
 def extract_unnatural_instructions_data(examples, extract_reformulations=False):
     out = {
         'input': [],
@@ -492,11 +545,6 @@ class PRM800KCriticSample(TypedDict):
     is_solution: bool
     is_preferred_response: bool
     rating: Optional[int]
-
-class ExtractedCriticSample(TypedDict):
-    input: str
-    continuation: str
-    rating: int
 
 process_supervision_critic_input = '''Below is an instruction that describes a task. Write a response that appropriately completes the request. Show your reasoning step-by-step, and indicate your final answer under a heading titled Answer.
 
@@ -670,7 +718,10 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         if args.group_by_length:
             train_dataset = train_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
 
-    data_collator = DataCollatorForCausalLM(
+    data_collator = DataCollatorForCriticLM(
+        tokenizer=tokenizer,
+        source_max_len=args.source_max_len,
+    ) if args.train_critic else DataCollatorForCausalLM(
         tokenizer=tokenizer,
         source_max_len=args.source_max_len,
         target_max_len=args.target_max_len,
