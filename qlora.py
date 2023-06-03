@@ -16,7 +16,8 @@ import bitsandbytes as bnb
 import pandas as pd
 
 import torch
-from torch import Tensor
+from torch import LongTensor, BoolTensor
+from contextlib import ContextDecorator
 import transformers
 from torch.nn.utils.rnn import pad_sequence
 import argparse
@@ -449,52 +450,66 @@ class DataCollatorForCausalLM(object):
 
 
 class ExtractedCriticSample(TypedDict):
-    input: str
+    prompt: str
     continuation: str
     rating: int
 
 @dataclass
+class truncation_side(ContextDecorator):
+    tokenizer: transformers.PreTrainedTokenizer
+    truncation_side: str
+    orig_truncation_side: Optional[str] = None
+
+    def __enter__(self):
+        self.orig_truncation_side = self.tokenizer.truncation_side
+        return self
+
+    def __exit__(self, *exc):
+        self.tokenizer.truncation_side = self.orig_truncation_side
+        return False
+
+
+@dataclass
 class DataCollatorForCriticLM(object):
     tokenizer: transformers.PreTrainedTokenizer
-    source_max_len: int
+    prompt_max_len: int
+    continuation_max_len: int
 
     def __call__(self, instances: Sequence[ExtractedCriticSample]) -> Dict[str, torch.Tensor]:
-        # Extract elements
-        sources = [f"{self.tokenizer.bos_token}{example['input']}{self.tokenizer.eos_token}" for example in instances]
-        continuations = [f"{example['continuation']}{self.tokenizer.eos_token}" for example in instances]
+        prompts: List[str] = [f"{self.tokenizer.bos_token}{example['prompt']}" for example in instances]
+        continuations: List[str] = [f"{example['continuation']}{self.tokenizer.eos_token}" for example in instances]
         # Tokenize
-        # input includes prompt **and** continuation
-        tokenized_input = self.tokenizer(
-            sources,
-            max_length=self.source_max_len,
-            # TODO: handle truncation ourselves, so we can manage how much of the continuation we lose
-            truncation=True,
-            add_special_tokens=False,
-        )
-        tokenized_continuation = self.tokenizer(
-            continuations,
-            max_length=self.source_max_len,
-            # TODO: handle truncation ourselves, so we can manage how much of the continuation we lose
-            truncation=True,
-            add_special_tokens=False,
-        )
-        # Build the input and labels for causal LM
-        input_ids: List[Tensor] = []
-        continuations: List[Tensor] = [] 
-        for tokenized_source, tokenized_continuation in zip(
-            tokenized_input['input_ids'], 
-            tokenized_continuation['input_ids']
+        with truncation_side(self.tokenizer, 'left'):
+            tokenized_prompts = self.tokenizer(
+                prompts,
+                max_length=self.prompt_max_len,
+                truncation=True,
+                add_special_tokens=False,
+            )
+        with truncation_side(self.tokenizer, 'right'):
+            tokenized_continuations = self.tokenizer(
+                continuations,
+                max_length=self.continuation_max_len,
+                truncation=True,
+                add_special_tokens=False,
+            )
+        continueds: List[LongTensor] = []
+        continuation_masks: List[BoolTensor] = [] 
+        for tokenized_prompt, tokenized_continuation in zip(
+            tokenized_prompts['input_ids'], 
+            tokenized_continuations['input_ids']
         ):
-            input_ids.append(torch.tensor(tokenized_source))
-            # TODO: what we want is probably an attention mask indicating which tokens of source, are continuations
-            continuations.append(torch.tensor(tokenized_continuation))
+            continued: LongTensor = torch.tensor(tokenized_prompt + tokenized_continuation)
+            continueds.append(continued)
+            continuation_mask: BoolTensor = torch.arange(0, continued.size(-1)) >= len(tokenized_prompt)
+            continuation_masks.append(continuation_mask)
         # Apply padding
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-        continuations = pad_sequence(continuations, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        continueds = pad_sequence(continueds, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        continuation_masks = pad_sequence(continuation_masks, batch_first=True, padding_value=0)
         data_dict = {
-            'input_ids': input_ids,
-            'attention_mask': input_ids.ne(self.tokenizer.pad_token_id),
-            'continuations': continuations,
+            'input_ids': continueds,
+            'attention_mask': continueds.ne(self.tokenizer.pad_token_id),
+            'continuation_mask': continuation_masks,
         }
         return data_dict
 
@@ -546,13 +561,13 @@ class PRM800KCriticSample(TypedDict):
     is_preferred_response: bool
     rating: Optional[int]
 
-process_supervision_critic_input = '''Below is an instruction that describes a task. Write a response that appropriately completes the request. Show your reasoning step-by-step, and indicate your final answer under a heading titled Answer.
+process_supervision_critic_prompt = '''Below is an instruction that describes a task. Write a response that appropriately completes the request. Show your reasoning step-by-step, and indicate your final answer under a heading titled Answer.
 
 ### Instruction:
 {instruction}
 
 ### Response:
-{response}'''
+{response_history}'''
 
 answer_response = '''{response}
 
@@ -565,11 +580,11 @@ def extract_prm800k_critic_dataset(example: PRM800KCriticSample) -> ExtractedCri
         answer=example['answer'],
     )
     mapped: ExtractedCriticSample = {
-        'input': process_supervision_critic_input.format(
+        'prompt': process_supervision_critic_prompt.format(
             instruction=example['instruction'],
-            response='\n'.join([*example['responses'], next_response]),
+            response_history=''.join((f'{response}\n' for response in example['responses'])),
         ),
-        'continuation': f'\n{next_response}' if example['responses'] else next_response,
+        'continuation': next_response,
         'rating': 1 if example['rating'] is None else example['rating'],
     }
     return mapped
@@ -720,7 +735,8 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
 
     data_collator = DataCollatorForCriticLM(
         tokenizer=tokenizer,
-        source_max_len=args.source_max_len,
+        prompt_max_len=args.source_max_len,
+        continuation_max_len=args.target_max_len,
     ) if args.train_critic else DataCollatorForCausalLM(
         tokenizer=tokenizer,
         source_max_len=args.source_max_len,
