@@ -8,7 +8,7 @@ import os
 from os.path import exists, join, isdir
 from dataclasses import dataclass, field
 import sys
-from typing import Optional, Dict, Sequence, TypedDict, List, Optional, Union
+from typing import Optional, Dict, Sequence, TypedDict, List, Optional, Union, Callable
 import numpy as np
 from tqdm import tqdm
 import logging
@@ -29,7 +29,6 @@ from transformers import (
 
 )
 from datasets import load_dataset, Dataset, DatasetDict
-from datasets.formatting.formatting import LazyRow
 import evaluate
 
 from peft import (
@@ -496,6 +495,7 @@ class PRM800KCriticSample(TypedDict):
 
 class ExtractedCriticSample(TypedDict):
     input: str
+    continuation: str
     rating: int
 
 process_supervision_critic_input = '''Below is an instruction that describes a task. Write a response that appropriately completes the request. Show your reasoning step-by-step, and indicate your final answer under a heading titled Answer.
@@ -521,6 +521,7 @@ def extract_prm800k_critic_dataset(example: PRM800KCriticSample) -> ExtractedCri
             instruction=example['instruction'],
             response='\n'.join([*example['responses'], next_response]),
         ),
+        'continuation': f'\n{next_response}' if example['responses'] else next_response,
         'rating': 1 if example['rating'] is None else example['rating'],
     }
     return mapped
@@ -581,7 +582,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         elif dataset_name == 'oasst1':
             return load_dataset("timdettmers/openassistant-guanaco")
         elif dataset_name == 'prm800k-critic':
-            return load_dataset("Birchlabs/openai-prm800k-stepwise-critic", streaming=True)
+            return load_dataset("Birchlabs/openai-prm800k-stepwise-critic")
         elif dataset_name == 'vicuna':
             raise NotImplementedError("Vicuna data was not released.")
         else:
@@ -623,9 +624,6 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             # leave as is
             pass
         elif dataset_format == 'prm800k-critic':
-            # dataset.set_
-            # dataset.set_transform(extract_prm800k_critic_dataset)
-            # print(dataset['train'][0])
             dataset = dataset.map(extract_prm800k_critic_dataset, remove_columns=[
                 'instruction',
                 # 'output',
@@ -636,8 +634,10 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
                 'is_solution',
                 'is_preferred_response',
             ])
-            # don't proceed to the "remove_columns()" call, because we cannot lookup column_names of IterableDataset.
-            # fortunately we already removed extraneously columns in the map() call.
+            # rating 0 is inconclusive; not much we can learn from that
+            filter: Callable[[ExtractedCriticSample], bool] = lambda sample: sample['rating'] != 0
+            dataset = dataset.filter(filter)
+            # we already filtered the columns we wanted to remove
             return dataset
         # Remove unused columns.
         dataset = dataset.remove_columns(
