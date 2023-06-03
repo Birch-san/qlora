@@ -8,7 +8,7 @@ import os
 from os.path import exists, join, isdir
 from dataclasses import dataclass, field
 import sys
-from typing import Optional, Dict, Sequence, TypedDict, List, Optional
+from typing import Optional, Dict, Sequence, TypedDict, List, Optional, Union
 import numpy as np
 from tqdm import tqdm
 import logging
@@ -28,7 +28,7 @@ from transformers import (
     LlamaTokenizer
 
 )
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, DatasetDict
 from datasets.formatting.formatting import LazyRow
 import evaluate
 
@@ -484,22 +484,46 @@ def extract_alpaca_dataset(example):
         prompt_format = ALPACA_PROMPT_DICT["prompt_no_input"]
     return {'input': prompt_format.format(**example)}
 
-class PRM800KCriticSampleData(TypedDict):
+class PRM800KCriticSample(TypedDict):
     instruction: str
     responses: List[str]
-    nest_response: str
+    next_response: str
     answer: Optional[str]
     is_human_response: bool
     is_solution: bool
     is_preferred_response: bool
     rating: Optional[int]
 
-class PRM800KCriticSample(LazyRow):
-    data: PRM800KCriticSampleData
+class ExtractedCriticSample(TypedDict):
+    input: str
+    rating: int
 
-def extract_prm800k_critic_dataset(example: PRM800KCriticSample):
-    # TODO
-    return {'input': 'hey'}
+process_supervision_critic_input = '''Below is an instruction that describes a task. Write a response that appropriately completes the request. Show your reasoning step-by-step, and indicate your final answer under a heading titled Answer.
+
+### Instruction:
+{instruction}
+
+### Response:
+{response}'''
+
+answer_response = '''{response}
+
+# Answer:
+{answer}'''
+
+def extract_prm800k_critic_dataset(example: PRM800KCriticSample) -> ExtractedCriticSample:
+    next_response = example['next_response'] if example['answer'] is None else answer_response.format(
+        response=example['next_response'],
+        answer=example['answer'],
+    )
+    mapped: ExtractedCriticSample = {
+        'input': process_supervision_critic_input.format(
+            instruction=example['instruction'],
+            response='\n'.join([*example['responses'], next_response]),
+        ),
+        'rating': 1 if example['rating'] is None else example['rating'],
+    }
+    return mapped
 
 def local_dataset(dataset_name):
     if dataset_name.endswith('.json'):
@@ -541,7 +565,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         - vicuna
 
     """
-    def load_data(dataset_name):
+    def load_data(dataset_name) -> Union[Dataset, DatasetDict]:
         if dataset_name == 'alpaca':
             return load_dataset("tatsu-lab/alpaca")
         elif dataset_name == 'alpaca-clean':
@@ -557,7 +581,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         elif dataset_name == 'oasst1':
             return load_dataset("timdettmers/openassistant-guanaco")
         elif dataset_name == 'prm800k-critic':
-            return load_dataset("Birchlabs/openai-prm800k-stepwise-critic")
+            return load_dataset("Birchlabs/openai-prm800k-stepwise-critic", streaming=True)
         elif dataset_name == 'vicuna':
             raise NotImplementedError("Vicuna data was not released.")
         else:
@@ -571,7 +595,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             else:
                 raise NotImplementedError(f"Dataset {dataset_name} not implemented yet.")
 
-    def format_dataset(dataset, dataset_format):
+    def format_dataset(dataset: Union[Dataset, DatasetDict], dataset_format) -> Union[Dataset, DatasetDict]:
         if (
             dataset_format == 'alpaca' or dataset_format == 'alpaca-clean' or
             (dataset_format is None and args.dataset in ['alpaca', 'alpaca-clean'])
@@ -599,8 +623,12 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             # leave as is
             pass
         elif dataset_format == 'prm800k-critic':
+            # dataset.set_
+            # dataset.set_transform(extract_prm800k_critic_dataset)
+            # print(dataset['train'][0])
             dataset = dataset.map(extract_prm800k_critic_dataset, remove_columns=[
                 'instruction',
+                # 'output',
                 'responses',
                 'next_response',
                 'answer',
@@ -608,6 +636,9 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
                 'is_solution',
                 'is_preferred_response',
             ])
+            # don't proceed to the "remove_columns()" call, because we cannot lookup column_names of IterableDataset.
+            # fortunately we already removed extraneously columns in the map() call.
+            return dataset
         # Remove unused columns.
         dataset = dataset.remove_columns(
             [col for col in dataset.column_names['train'] if col not in ['input', 'output']]
