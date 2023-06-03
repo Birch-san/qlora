@@ -8,7 +8,7 @@ import os
 from os.path import exists, join, isdir
 from dataclasses import dataclass, field
 import sys
-from typing import Optional, Dict, Sequence
+from typing import Optional, Dict, Sequence, TypedDict, List, Optional
 import numpy as np
 from tqdm import tqdm
 import logging
@@ -29,6 +29,7 @@ from transformers import (
 
 )
 from datasets import load_dataset, Dataset
+from datasets.formatting.formatting import LazyRow
 import evaluate
 
 from peft import (
@@ -95,7 +96,7 @@ class DataArguments:
     )
     dataset_format: Optional[str] = field(
         default=None,
-        metadata={"help": "Which dataset format is used. [alpaca|chip2|self-instruct|hh-rlhf]"}
+        metadata={"help": "Which dataset format is used. [alpaca|chip2|self-instruct|hh-rlhf|prm800k-critic]"}
     )
 
 @dataclass
@@ -185,6 +186,14 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
     save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
     save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
+    train_critic: Optional[bool] = field(
+        default=False,
+        # if you are projecting to multiple mutually exclusive classes: you will want to softmax them.
+        # otherwise: sigmoid each class individually (assuming negative is a confidence rating you wish to support)
+        # the domain of ratings PRM800K can report is ±1, but who knows what the model will learn
+        # sigmoid will keep that under control
+        metadata={"help": "Whether to replace the final linear layer of the model's decoder (projection to token probabilities) with a projection to a classification confidence. This new linear layer will **not** be a LoRA; it'll be the real deal."}
+    )
 
 @dataclass
 class GenerationArguments:
@@ -341,6 +350,9 @@ def get_accelerate_model(args, checkpoint_dir):
             if hasattr(module, 'weight'):
                 if args.bf16 and module.weight.dtype == torch.float32:
                     module = module.to(torch.bfloat16)
+
+    torch.cuda.empty_cache()
+    
     return model
 
 def print_trainable_parameters(args, model):
@@ -472,6 +484,23 @@ def extract_alpaca_dataset(example):
         prompt_format = ALPACA_PROMPT_DICT["prompt_no_input"]
     return {'input': prompt_format.format(**example)}
 
+class PRM800KCriticSampleData(TypedDict):
+    instruction: str
+    responses: List[str]
+    nest_response: str
+    answer: Optional[str]
+    is_human_response: bool
+    is_solution: bool
+    is_preferred_response: bool
+    rating: Optional[int]
+
+class PRM800KCriticSample(LazyRow):
+    data: PRM800KCriticSampleData
+
+def extract_prm800k_critic_dataset(example: PRM800KCriticSample):
+    # TODO
+    return {'input': 'hey'}
+
 def local_dataset(dataset_name):
     if dataset_name.endswith('.json'):
         full_dataset = Dataset.from_json(path_or_paths=dataset_name)
@@ -500,6 +529,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         - hh-rlhf (Anthropic), 160800 examples
         - longform, 23.7k examples
         - oasst1 (OpenAssistant) primary message tree only, 9,846 examples
+        - prm800k-critic (for training a critic)
 
     Coming soon:
         - unnatural instructions core, 66010 examples
@@ -526,6 +556,8 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             return load_dataset("akoksal/LongForm")
         elif dataset_name == 'oasst1':
             return load_dataset("timdettmers/openassistant-guanaco")
+        elif dataset_name == 'prm800k-critic':
+            return load_dataset("Birchlabs/openai-prm800k-stepwise-critic")
         elif dataset_name == 'vicuna':
             raise NotImplementedError("Vicuna data was not released.")
         else:
@@ -566,6 +598,16 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         elif dataset_format == 'input-output':
             # leave as is
             pass
+        elif dataset_format == 'prm800k-critic':
+            dataset = dataset.map(extract_prm800k_critic_dataset, remove_columns=[
+                'instruction',
+                'responses',
+                'next_response',
+                'answer',
+                'is_human_response',
+                'is_solution',
+                'is_preferred_response',
+            ])
         # Remove unused columns.
         dataset = dataset.remove_columns(
             [col for col in dataset.column_names['train'] if col not in ['input', 'output']]
@@ -652,7 +694,7 @@ def train():
         args.model_name_or_path,
         cache_dir=args.cache_dir,
         padding_side="right",
-        use_fast=False, # Fast tokenizer giving issues.
+        use_fast='pythia' in args.model_name_or_path, # Fast tokenizer giving issues.
         tokenizer_type='llama' if 'llama' in args.model_name_or_path else None, # Needed for HF name change
         use_auth_token=args.use_auth_token,
     )
